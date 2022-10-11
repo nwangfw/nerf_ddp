@@ -7,6 +7,6 @@ The author's repo is https://github.com/krrish94/nerf-pytorch
 
 launch command if you have one machine with 8 GPUs
 ```
-python mnist-distributed.py -n 1 -g 8 -i 0
+python tiny_nerf_pytorch_ddp.py -n 1 -g 8 -i 0
 ```
 
