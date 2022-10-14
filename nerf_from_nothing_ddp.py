@@ -30,13 +30,15 @@ from datetime import datetime
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+#from torch.utils.tensorboard import SummaryWriter
 
 # For repeatability
-# seed = 3407
-# torch.manual_seed(seed)
-# np.random.seed(seed)
+seed = 3407
+torch.manual_seed(seed)
+np.random.seed(seed)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#writer = SummaryWriter()
 
 """# Inputs
 
@@ -118,40 +120,6 @@ def get_rays(
   rays_o = c2w[:3, -1].expand(rays_d.shape)
   return rays_o, rays_d
 
-def get_rays_ddp(
-  height: int,
-  width: int,
-  focal_length: float,
-  c2w: torch.Tensor,
-  start_heights: list,
-  rank: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-  r"""
-  Find origin and direction of rays through every pixel and camera origin.
-  """
-
-  # Apply pinhole camera model to gather directions at each pixel
-  i, j = torch.meshgrid(
-      torch.arange(width, dtype=torch.float32).to(c2w),
-      torch.arange(height, dtype=torch.float32).to(c2w),
-      indexing='ij')
-  i, j = i.transpose(-1, -2), j.transpose(-1, -2)
-  directions = torch.stack([(i - width * .5) / focal_length,
-                            -(j - height * .5) / focal_length,
-                            -torch.ones_like(i)
-                           ], dim=-1)
-
-  # Apply camera pose to directions
-  rays_d = torch.sum(directions[..., None, :] * c2w[:3, :3], dim=-1)
-
-  # Origin is same for all directions (the optical center)
-  rays_o = c2w[:3, -1].expand(rays_d.shape)
-  return rays_o[start_heights[rank]: start_heights[rank+1]], rays_d[start_heights[rank]: start_heights[rank+1]]
-# Grab rays from sample image
-#height, width = images.shape[1:3]
-#with torch.no_grad():
-#  ray_origin, ray_direction = get_rays(height, width, focal, testpose)
-
 
 
 """# Architecture
@@ -199,73 +167,6 @@ def sample_stratified(
   pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
   return pts, z_vals
 
-def sample_stratified_ddp(
-  rays_o: torch.Tensor,
-  rays_d: torch.Tensor,
-  near: float,
-  far: float,
-  n_samples: int,
-  start_heights: list,
-  rank: int,
-  perturb: Optional[bool] = True,
-  inverse_depth: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-  r"""
-  Sample along ray from regularly-spaced bins.
-  """
-
-  # Grab samples for space integration along ray
-  t_vals = torch.linspace(0., 1., n_samples, device=rays_o.device)
-  if not inverse_depth:
-    # Sample linearly between `near` and `far`
-    z_vals = near * (1.-t_vals) + far * (t_vals)
-  else:
-    # Sample linearly in inverse depth (disparity)
-    z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
-
-  # Draw uniform samples from bins along ray
-  if perturb:
-    mids = .5 * (z_vals[1:] + z_vals[:-1])
-    upper = torch.concat([mids, z_vals[-1:]], dim=-1)
-    lower = torch.concat([z_vals[:1], mids], dim=-1)
-    t_rand = torch.rand([n_samples], device=z_vals.device)
-    z_vals = lower + (upper - lower) * t_rand
-  z_vals = z_vals.expand(list(rays_o.shape[:-1]) + [n_samples])
-
-  # Apply scale from `rays_d` and offset from `rays_o` to samples
-  # pts: (width, height, n_samples, 3)
-  pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
-  return pts[start_heights[rank]: start_heights[rank+1]], z_vals[start_heights[rank]: start_heights[rank+1]]
-
-# # Draw stratified samples from example
-# rays_o = ray_origin.view([-1, 3])
-# rays_d = ray_direction.view([-1, 3])
-# n_samples = 8
-# perturb = True
-# inverse_depth = False
-# with torch.no_grad():
-#   pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_samples,
-#                                   perturb=perturb, inverse_depth=inverse_depth)
-
-# print('Input Points')
-# print(pts.shape)
-# print('')
-# print('Distances Along Ray')
-# print(z_vals.shape)
-
-"""Now we visualize these sampled points. The unperturbed blue points are the bin "centers." The red points are a sampling of perturbed points. Notice how the red points are slightly offset from the blue points above them, but all are constrained between `near` and `far`."""
-
-# y_vals = torch.zeros_like(z_vals)
-
-# _, z_vals_unperturbed = sample_stratified(rays_o, rays_d, near, far, n_samples,
-#                                   perturb=False, inverse_depth=inverse_depth)
-# plt.plot(z_vals_unperturbed[0].cpu().numpy(), 1 + y_vals[0].cpu().numpy(), 'b-o')
-# plt.plot(z_vals[0].cpu().numpy(), y_vals[0].cpu().numpy(), 'r-o')
-# plt.ylim([-1, 2])
-# plt.title('Stratified Sampling (blue) with Perturbation (red)')
-# ax = plt.gca()
-# ax.axes.yaxis.set_visible(False)
-# plt.grid(True)
 
 """## Positional Encoder
 
@@ -311,28 +212,6 @@ class PositionalEncoder(nn.Module):
     """
     return torch.concat([fn(x) for fn in self.embed_fns], dim=-1)
 
-# Create encoders for points and view directions
-# encoder = PositionalEncoder(3, 10)
-# viewdirs_encoder = PositionalEncoder(3, 4)
-
-# # Grab flattened points and view directions
-# pts_flattened = pts.reshape(-1, 3)
-# viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
-# flattened_viewdirs = viewdirs[:, None, ...].expand(pts.shape).reshape((-1, 3))
-
-# # Encode inputs
-# encoded_points = encoder(pts_flattened)
-# encoded_viewdirs = viewdirs_encoder(flattened_viewdirs)
-
-# print('Encoded Points')
-# print(encoded_points.shape)
-# print(torch.min(encoded_points), torch.max(encoded_points), torch.mean(encoded_points))
-# print('')
-
-# print(encoded_viewdirs.shape)
-# print('Encoded Viewdirs')
-# print(torch.min(encoded_viewdirs), torch.max(encoded_viewdirs), torch.mean(encoded_viewdirs))
-# print('')
 
 """## NeRF Model
 
@@ -727,112 +606,6 @@ def nerf_forward(
   outputs['weights'] = weights
   return outputs
 
-
-def nerf_forward_ddp(
-  rays_o: torch.Tensor,
-  rays_d: torch.Tensor,
-  near: float,
-  far: float,
-  encoding_fn: Callable[[torch.Tensor], torch.Tensor],
-  coarse_model: nn.Module,
-  kwargs_sample_stratified: dict = None,
-  n_samples_hierarchical: int = 0,
-  kwargs_sample_hierarchical: dict = None,
-  fine_model = None,
-  viewdirs_encoding_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-  chunksize: int = 2**15
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-  r"""
-  Compute forward pass through model(s).
-  """
-
-  # Set no kwargs if none are given.
-  if kwargs_sample_stratified is None:
-    kwargs_sample_stratified = {}
-  if kwargs_sample_hierarchical is None:
-    kwargs_sample_hierarchical = {}
-  
-  # Sample query points along each ray.
-  query_points, z_vals = sample_stratified(
-      rays_o, rays_d, near, far, **kwargs_sample_stratified)
-  
-  #print('-----------------')
-  #print('query_points sample_stratified', query_points.shape)
-
-  # Prepare batches.
-  batches = prepare_chunks(query_points, encoding_fn, chunksize=chunksize)
-  if viewdirs_encoding_fn is not None:
-    batches_viewdirs = prepare_viewdirs_chunks(query_points, rays_d,
-                                               viewdirs_encoding_fn,
-                                               chunksize=chunksize)
-  else:
-    batches_viewdirs = [None] * len(batches)
-
-  # Coarse model pass.
-  # Split the encoded points into "chunks", run the model on all chunks, and
-  # concatenate the results (to avoid out-of-memory issues).
-  predictions = []
-  for batch, batch_viewdirs in zip(batches, batches_viewdirs):
-    predictions.append(coarse_model(batch, viewdirs=batch_viewdirs))
-  raw = torch.cat(predictions, dim=0)
-  raw = raw.reshape(list(query_points.shape[:2]) + [raw.shape[-1]])
-
-
-  # Perform differentiable volume rendering to re-synthesize the RGB image.
-  rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals, rays_d)
-  # rgb_map, depth_map, acc_map, weights = render_volume_density(raw, rays_o, z_vals)
-  outputs = {
-      'z_vals_stratified': z_vals
-  }
-  
-  #print('rgb_map sample_stratified', rgb_map.shape)
- 
-  # Fine model pass.
-  if n_samples_hierarchical > 0:
-    # Save previous outputs to return.
-    rgb_map_0, depth_map_0, acc_map_0 = rgb_map, depth_map, acc_map
-
-    # Apply hierarchical sampling for fine query points.
-    query_points, z_vals_combined, z_hierarch = sample_hierarchical(
-      rays_o, rays_d, z_vals, weights, n_samples_hierarchical,
-      **kwargs_sample_hierarchical)
-
-    #print('fine model hierarchical query_points: ', query_points.shape)
-
-    # Prepare inputs as before.
-    batches = prepare_chunks(query_points, encoding_fn, chunksize=chunksize)
-    if viewdirs_encoding_fn is not None:
-      batches_viewdirs = prepare_viewdirs_chunks(query_points, rays_d,
-                                                 viewdirs_encoding_fn,
-                                                 chunksize=chunksize)
-    else:
-      batches_viewdirs = [None] * len(batches)
-
-    # Forward pass new samples through fine model.
-    fine_model = fine_model if fine_model is not None else coarse_model
-    predictions = []
-    for batch, batch_viewdirs in zip(batches, batches_viewdirs):
-      predictions.append(fine_model(batch, viewdirs=batch_viewdirs))
-    raw = torch.cat(predictions, dim=0)
-    raw = raw.reshape(list(query_points.shape[:2]) + [raw.shape[-1]])
-
-    # Perform differentiable volume rendering to re-synthesize the RGB image.
-    rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals_combined, rays_d)
-    
-    #print('fine model hierarchical rgb map: ', rgb_map.shape)
-
-    # Store outputs.
-    outputs['z_vals_hierarchical'] = z_hierarch
-    outputs['rgb_map_0'] = rgb_map_0
-    outputs['depth_map_0'] = depth_map_0
-    outputs['acc_map_0'] = acc_map_0
-
-  # Store outputs.
-  outputs['rgb_map'] = rgb_map
-  outputs['depth_map'] = depth_map
-  outputs['acc_map'] = acc_map
-  outputs['weights'] = weights
-  return outputs
 
 """# Train
 
@@ -1229,9 +1002,9 @@ def main():
     args = parser.parse_args()
     gpu_list = [int(gpu) for gpu in args.gpus.split(',')]
     args.world_size = sum(gpu_list)
-    print("This code is running.")
+    print("This code is running. If you see nothing after a while. Check your master IP address.")
     args.world_size = sum(gpu_list)
-    os.environ["MASTER_ADDR"] = "10.145.83.59"
+    os.environ["MASTER_ADDR"] = "10.175.20.129"
     os.environ["MASTER_PORT"] = "9514"
     for _ in range(args.number_of_tests):
       mp.spawn(train,
