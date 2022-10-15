@@ -25,6 +25,8 @@ from torch import nn
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import axes3d
 from tqdm import trange
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter()
 
 # For repeatability
 # seed = 3407
@@ -896,6 +898,7 @@ def train():
         rgb_predicted_coarse = outputs['rgb_map_0']
 
         loss = torch.nn.functional.mse_loss(rgb_predicted_coarse, target_img) + torch.nn.functional.mse_loss(rgb_predicted, target_img)
+        writer.add_scalar("Loss/train", loss, i)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -966,7 +969,7 @@ def train():
             if warmup_stopper is not None and warmup_stopper(i, psnr):
                 print(f'Train PSNR flatlined at {psnr} for {warmup_stopper.patience} iters. Stopping...')
                 return False, train_psnrs, val_psnrs
-
+    writer.flush()
     return True, train_psnrs, val_psnrs
 
 # Run training session(s)
@@ -977,6 +980,7 @@ for _ in range(n_restarts):
         print('Training successful!')
         break
 
+writer.close()
 print('')
 print(f'Done!')
 

@@ -11,7 +11,7 @@ Original file is located at
 
 This notebook walks the reader through a full implementation of the original Neural Radiance Field architecture, first introduced by Mildenhall et al. in "[NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis.](https://www.matthewtancik.com/nerf)" For a broader overview, read the accompanying Medium article "[It's NeRF From Nothing: Build A Complete NeRF With Pytorch.](https://medium.com/@masonmcgough/its-nerf-from-nothing-build-a-vanilla-nerf-with-pytorch-7846e4c45666)" This notebook assumes that you have read that article and understand the basics of NeRF.
 
-Much of the code comes from or is inspired by the original implementation by GitHub user [bmild](https://github.com/bmild/nerf) as well as PyTorch implementations from GitHub users [yenchenlin](https://github.com/bmild/nerf) and [krrish94](https://github.com/krrish94/nerf-pytorch/). The code has been modified for clarity and consistency.
+Much of the code comes from or is inspired by the original implementation by GitHub user [bmild](https://github.com/bmild/nerf) as well as PyTorch implementations from GitHub users [yenchenlin](https://github.com/bmild/nerf) and [krrish94](https://github.com/krrish94/nerf-pytorch/) and https://towardsdatascience.com/its-nerf-from-nothing-build-a-vanilla-nerf-with-pytorch-7846e4c45666. The code has been modified for clarity and consistency.
 
 ## Imports
 """
@@ -22,6 +22,7 @@ import argparse
 import warnings
 import numpy as np
 import torch
+import torchvision
 from torch import nn
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import axes3d
@@ -30,7 +31,7 @@ from datetime import datetime
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-#from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 # For repeatability
 seed = 3407
@@ -38,7 +39,6 @@ torch.manual_seed(seed)
 np.random.seed(seed)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#writer = SummaryWriter()
 
 """# Inputs
 
@@ -91,6 +91,15 @@ origins = poses[:, :3, -1]
 
 From [Willy Azarcoya-Cabiedes via ResearchGate](https://www.researchgate.net/figure/Pin-hole-camera-model-terminology-The-optical-center-pinhole-is-placed-at-the-origin_fig10_317498100)
 """
+# change tensor to image
+def cast_to_image(tensor):
+    # Input tensor is (H, W, 3). Convert to (3, H, W).
+    tensor = tensor.permute(2, 0, 1)
+    # Conver to PIL Image and then np.array (output shape: (H, W, 3))
+    img = np.array(torchvision.transforms.ToPILImage()(tensor.detach().cpu()))
+    # Map back to shape (3, H, W), as tensorboard needs channels first.
+    img = np.moveaxis(img, [-1], [0])
+    return img
 
 def get_rays(
   height: int,
@@ -799,6 +808,9 @@ def train(gpu, args):
   testimg = torch.from_numpy(data['images'][testimg_idx]).to(gpu)
   testpose = torch.from_numpy(data['poses'][testimg_idx]).to(gpu)
 
+  logdir = "runs/nerf_ddp/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+  if rank == 0:
+    writer = SummaryWriter(logdir)
 
 
   if not one_image_per_step:
@@ -821,7 +833,6 @@ def train(gpu, args):
 
   for i in trange(n_iters):
     model.train()
-
     if one_image_per_step:
         # Randomly pick an image as the target.
         target_img_idx = np.random.randint(images.shape[0])
@@ -886,14 +897,41 @@ def train(gpu, args):
         if torch.isinf(v).any():
             print(f"! [Numerical Alert] {k} contains Inf.")
 
-    # Backprop!
+
+
     rgb_predicted = outputs['rgb_map']
     rgb_predicted_coarse = outputs['rgb_map_0']
     #print("rgb_predicted_shape", rgb_predicted.shape)
     #print("rgb_predicted_coarse_shape",rgb_predicted_coarse.shape)
-    loss = torch.nn.functional.mse_loss(rgb_predicted_coarse, target_img[start_heights[rank]: start_heights[rank+1]]) + torch.nn.functional.mse_loss(rgb_predicted, target_img[start_heights[rank]: start_heights[rank+1]])
+    
+    #visualize testing
+    if rank == 0 and i % display_rate == 0:
+      writer.add_image(
+          "train/rgb_fine", cast_to_image(rgb_predicted.reshape([-1, width, 3])), i
+      )
+      writer.add_image(
+          "train/rgb_coarse", cast_to_image(rgb_predicted_coarse.reshape([-1, width, 3])), i
+      )
+      writer.add_image(
+          "train/rgb_ground truth", cast_to_image(target_img[start_heights[rank]: start_heights[rank+1]].reshape([-1, width, 3])), i
+      )
+
+    coarse_loss = torch.nn.functional.mse_loss(rgb_predicted_coarse, target_img[start_heights[rank]: start_heights[rank+1]])
+    fine_loss = torch.nn.functional.mse_loss(rgb_predicted, target_img[start_heights[rank]: start_heights[rank+1]])
+    loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
+
+    # Backprop!
+
     loss.backward()
     optimizer.step()
+    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+    loss /= args.world_size
+
+    if rank == 0:
+      writer.add_scalar("train/fine loss", fine_loss.item(), i)
+      writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
+      writer.add_scalar("train/loss", loss.item(), i)
+
     optimizer.zero_grad()
 
     # Compute mean-squared error between predicted and target images.
@@ -903,6 +941,7 @@ def train(gpu, args):
     # Evaluate testimg at given display rate.
     if rank == 0 and i % display_rate == 0:
         model.eval()
+        #use testimg to get consistant curve
         height, width = testimg.shape[:2]
         rays_o, rays_d = get_rays(height, width, focal, testpose)
         rays_o = rays_o.reshape([-1, 3])
@@ -917,7 +956,22 @@ def train(gpu, args):
                                 chunksize=chunksize)
         rgb_predicted_coarse = outputs['rgb_map_0']
         rgb_predicted = outputs['rgb_map']
-        loss = torch.nn.functional.mse_loss(rgb_predicted_coarse, testimg.reshape(-1, 3)) 
+        fine_loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3)) 
+        coarse_loss = torch.nn.functional.mse_loss(rgb_predicted_coarse, testimg.reshape(-1, 3)) 
+        loss = fine_loss + coarse_loss
+        writer.add_scalar("validation/loss", loss.item(), i)
+        writer.add_scalar("validation/coarse_loss", coarse_loss.item(), i)
+        writer.add_scalar("validation/fine_loss", fine_loss.item(), i)
+        writer.add_image(
+            "validation/rgb_fine", cast_to_image(rgb_predicted.reshape([-1, width, 3])), i
+        )
+        writer.add_image(
+            "validation/rgb_coarse", cast_to_image(rgb_predicted_coarse.reshape([-1, width, 3])), i
+        )
+        writer.add_image(
+            "validation/rgb_ground truth", cast_to_image(testimg.reshape([-1, width, 3])), i
+        )
+
         # loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
         #print("Loss:", loss.item())
         print('Iteration: {}/{}, Val Loss: {:.4f}, Time: {}'.format(i, n_iters, loss.item(), (datetime.now() - start)))
@@ -925,35 +979,37 @@ def train(gpu, args):
         val_psnr = -10. * torch.log10(loss)
         
         val_psnrs.append(val_psnr.item())
+        writer.add_scalar("psnr", val_psnr.item(), i)
+
         iternums.append(i)
 
-        # Plot example outputs
-        fig, ax = plt.subplots(1, 5, figsize=(24,5), gridspec_kw={'width_ratios': [1, 1, 1, 1, 2]})
-        ax[0].imshow(rgb_predicted.reshape([height, width, 3]).detach().cpu().numpy())
-        ax[0].set_title(f'Fine Iteration: {i}')
-        ax[1].imshow(rgb_predicted_coarse.reshape([height, width, 3]).detach().cpu().numpy())
-        ax[1].set_title(f'Coarse Iteration: {i}')
-        ax[2].imshow(testimg.detach().cpu().numpy())
-        ax[2].set_title(f'Target')
-        ax[3].plot(range(0, i + 1), train_psnrs, 'r')
-        ax[3].plot(iternums, val_psnrs, 'b')
-        ax[3].set_title('PSNR (train=red, val=blue')
-        z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
-        z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
-        if 'z_vals_hierarchical' in outputs:
-            z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
-            z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
-        else:
-            z_sample_hierarch = None
-        _ = plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[4])
-        ax[4].margins(0)
-        #plt.show()
+        # # Save plot directly
+        # fig, ax = plt.subplots(1, 5, figsize=(24,5), gridspec_kw={'width_ratios': [1, 1, 1, 1, 2]})
+        # ax[0].imshow(rgb_predicted.reshape([height, width, 3]).detach().cpu().numpy())
+        # ax[0].set_title(f'Fine Iteration: {i}')
+        # ax[1].imshow(rgb_predicted_coarse.reshape([height, width, 3]).detach().cpu().numpy())
+        # ax[1].set_title(f'Coarse Iteration: {i}')
+        # ax[2].imshow(testimg.detach().cpu().numpy())
+        # ax[2].set_title(f'Target')
+        # ax[3].plot(range(0, i + 1), train_psnrs, 'r')
+        # ax[3].plot(iternums, val_psnrs, 'b')
+        # ax[3].set_title('PSNR (train=red, val=blue')
+        # z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
+        # z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
+        # if 'z_vals_hierarchical' in outputs:
+        #     z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
+        #     z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
+        # else:
+        #     z_sample_hierarch = None
+        # _ = plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[4])
+        # ax[4].margins(0)
+        # #plt.show()
         
-        path = '{}/logs/ddp'.format(os.getcwd())
-        if not os.path.exists(path):
-            os.makedirs(path)
-        fig.savefig(os.path.join(path, "Iteration_{}.png".format(i)))
-        plt.close(fig)
+        # path = '{}/logs/ddp'.format(os.getcwd())
+        # if not os.path.exists(path):
+        #     os.makedirs(path)
+        # fig.savefig(os.path.join(path, "Iteration_{}.png".format(i)))
+        # plt.close(fig)
 
     # # Check PSNR for issues and stop if any are found.
     # if i == warmup_iters - 1:
@@ -966,6 +1022,10 @@ def train(gpu, args):
     #         return False, train_psnrs, val_psnrs
   if gpu == 0:    
     print("Training complete in: " + str(datetime.now() - start))
+
+  if rank == 0:
+    writer.close()
+  
   cleanup()
   return True, train_psnrs, val_psnrs
 
