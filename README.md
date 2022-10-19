@@ -32,7 +32,6 @@ launch command if you have two machines with 8 GPUs each
 ```
 python nerf_pytorch_ddp.py -n 2 -g 8,8 -i 0
 python nerf_pytorch_ddp.py -n 2 -g 8,8 -i 1
-
 ```
 
 The results show the with DDP, the NeRF training time can be reduced by 5 times.
